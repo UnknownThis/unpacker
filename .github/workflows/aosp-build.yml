@@ -1,4 +1,4 @@
-name: AOSP 7.1.2 build preflight
+name: Build Youpk for AOSP 7.1.2
 
 on:
   push:
@@ -9,10 +9,13 @@ permissions:
   contents: read
 
 jobs:
-  preflight:
+  build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    timeout-minutes: 360
     steps:
+      - name: Check out Youpk patch source
+        uses: actions/checkout@v4
+
       - name: Report baseline resources
         run: |
           set -euxo pipefail
@@ -40,3 +43,32 @@ jobs:
           free -h
           df -h /
           df -i /
+
+      - name: Build AOSP libart in Ubuntu 20.04
+        run: |
+          set -euxo pipefail
+          docker run --rm \
+            -e WORKSPACE=/workspace \
+            -e JOBS=4 \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -w /workspace \
+            ubuntu:20.04 \
+            bash /workspace/ci/build-aosp-7.1.2.sh
+
+      - name: Upload libart and build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: youpk-sailfish-libart-${{ github.sha }}
+          if-no-files-found: warn
+          retention-days: 7
+          path: |
+            ci-logs/**
+            aosp/out/target/product/sailfish/system/lib/libart.so
+            aosp/out/target/product/sailfish/system/lib64/libart.so
+            aosp/out/target/product/sailfish/system/lib/libartd.so
+            aosp/out/target/product/sailfish/system/lib64/libartd.so
+            aosp/out/target/product/sailfish/symbols/system/lib/libart.so
+            aosp/out/target/product/sailfish/symbols/system/lib64/libart.so
+            aosp/out/target/product/sailfish/symbols/system/lib/libartd.so
+            aosp/out/target/product/sailfish/symbols/system/lib64/libartd.so
