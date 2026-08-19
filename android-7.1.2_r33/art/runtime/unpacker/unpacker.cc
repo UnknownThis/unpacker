@@ -99,7 +99,7 @@ static std::string UnpackerReadFile(const std::string& path, size_t max_size, bo
     return std::string();
   }
   std::string data;
-  std::array<char, 4096> buffer;
+  std::vector<char> buffer(4096);
   size_t read_limit = max_size == std::numeric_limits<size_t>::max() ? max_size : max_size + 1;
   while (data.size() < read_limit) {
     size_t remaining = read_limit - data.size();
