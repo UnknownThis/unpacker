@@ -1,0 +1,42 @@
+name: AOSP 7.1.2 build preflight
+
+on:
+  push:
+    branches:
+      - agent/youpk-v1-build
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Report baseline resources
+        run: |
+          set -euxo pipefail
+          uname -a
+          lscpu
+          free -h
+          df -h /
+          df -i /
+
+      - name: Remove preinstalled toolchains
+        run: |
+          set -euxo pipefail
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/share/dotnet \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost
+          sudo apt-get clean
+          docker system prune --all --force || true
+
+      - name: Report usable resources
+        run: |
+          set -euxo pipefail
+          free -h
+          df -h /
+          df -i /
