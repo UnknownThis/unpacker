@@ -74,8 +74,10 @@ du -sh "$AOSP_DIR" "$AOSP_DIR/.repo" || true
 rsync -a "$WORKSPACE/android-7.1.2_r33/art/" "$AOSP_DIR/art/"
 rsync -a "$WORKSPACE/android-7.1.2_r33/frameworks/" "$AOSP_DIR/frameworks/"
 
+set +u
 source build/envsetup.sh
 lunch aosp_sailfish-userdebug
+set -u
 export USE_CCACHE=0
 make -j"$JOBS" libart libartd
 
