@@ -35,6 +35,7 @@ apt-get install -y --no-install-recommends \
   lzop \
   openjdk-8-jdk \
   python2 \
+  python3 \
   rsync \
   unzip \
   x11proto-core-dev \
