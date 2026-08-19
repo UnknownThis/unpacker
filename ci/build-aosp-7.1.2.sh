@@ -29,8 +29,10 @@ apt-get install -y --no-install-recommends \
   libc6-dev-i386 \
   libgl1-mesa-dev \
   liblz4-tool \
+  libncurses5 \
   libncurses5-dev \
   libssl-dev \
+  libtinfo5 \
   libxml2-utils \
   lzop \
   openjdk-8-jdk \
