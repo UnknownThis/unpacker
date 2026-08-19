@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -189,14 +190,15 @@ static bool UnpackerJsonUint32(cJSON* object, const char* name, uint32_t* output
     return false;
   }
   double value = cJSON_GetNumberValue(item);
-  if (value < 0 || value > std::numeric_limits<uint32_t>::max()) {
+  if (!std::isfinite(value) || value < 0 ||
+      value > std::numeric_limits<uint32_t>::max()) {
     return false;
   }
-  uint32_t converted = static_cast<uint32_t>(value);
-  if (static_cast<double>(converted) != value) {
+  double integer_part = 0;
+  if (std::modf(value, &integer_part) > 0) {
     return false;
   }
-  *output = converted;
+  *output = static_cast<uint32_t>(integer_part);
   return true;
 }
 
