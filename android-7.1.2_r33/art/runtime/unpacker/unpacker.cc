@@ -1,4 +1,5 @@
 #include "unpacker.h"
+#include "unpacker_code_item.h"
 #include "base/macros.h"
 #include "globals.h"
 #include "instrumentation.h"
@@ -8,10 +9,19 @@
 #include "object_lock.h"
 
 #include <android/log.h>
+#include <algorithm>
+#include <array>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <map>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <fcntl.h>
+#include <limits>
 #include <string>
+#include <unistd.h>
+#include <vector>
 
 #define ULOG_TAG "unpacker"
 #define TOSTR(fmt) #fmt
@@ -25,6 +35,10 @@
 
 
 #define UNPACKER_WORKSPACE "unpacker"
+#define UNPACKER_V1_CONFIG "/data/local/tmp/unpacker.tasks.v1.json"
+#define UNPACKER_V1_MAX_CONFIG_SIZE (1024 * 1024)
+#define UNPACKER_V1_MAX_TASKS 1000
+#define UNPACKER_V1_MAX_CODE_ITEM_SIZE (4 * 1024 * 1024)
 
 namespace art {
 
@@ -40,6 +54,392 @@ static cJSON* Unpacker_json_ = nullptr;
 static std::list<const DexFile*> Unpacker_dex_files_;
 static mirror::ClassLoader* Unpacker_class_loader_ = nullptr;
 static std::map<std::string, int> Unpacker_method_fds_;
+static std::map<const DexFile*, std::string> Unpacker_dex_sha256_;
+static ArtMethod* Unpacker_target_method_ = nullptr;
+static std::vector<uint8_t> Unpacker_before_code_item_;
+static std::vector<uint8_t> Unpacker_dumped_code_item_;
+static bool Unpacker_dump_succeeded_ = false;
+
+struct UnpackerV1Task {
+  std::string dex_sha256;
+  uint32_t method_idx;
+  std::string class_descriptor;
+  std::string name;
+  std::string signature;
+  uint32_t access_flags;
+  std::string invoke_policy;
+};
+
+struct UnpackerV1Config {
+  std::string run_id;
+  std::string package_name;
+  std::vector<UnpackerV1Task> tasks;
+};
+
+static bool UnpackerWriteAll(int fd, const void* data, size_t size) {
+  const uint8_t* cursor = reinterpret_cast<const uint8_t*>(data);
+  while (size > 0) {
+    ssize_t written = TEMP_FAILURE_RETRY(write(fd, cursor, size));
+    if (written <= 0) {
+      return false;
+    }
+    cursor += written;
+    size -= static_cast<size_t>(written);
+  }
+  return true;
+}
+
+static std::string UnpackerReadFile(const std::string& path, size_t max_size, bool* too_large) {
+  if (too_large != nullptr) {
+    *too_large = false;
+  }
+  int fd = TEMP_FAILURE_RETRY(open(path.c_str(), O_RDONLY | O_CLOEXEC));
+  if (fd == -1) {
+    return std::string();
+  }
+  std::string data;
+  std::array<char, 4096> buffer;
+  size_t read_limit = max_size == std::numeric_limits<size_t>::max() ? max_size : max_size + 1;
+  while (data.size() < read_limit) {
+    size_t remaining = read_limit - data.size();
+    size_t request = std::min(buffer.size(), remaining);
+    ssize_t count = TEMP_FAILURE_RETRY(read(fd, buffer.data(), request));
+    if (count < 0) {
+      data.clear();
+      break;
+    }
+    if (count == 0) {
+      break;
+    }
+    data.append(buffer.data(), static_cast<size_t>(count));
+  }
+  close(fd);
+  if (data.size() > max_size) {
+    if (too_large != nullptr) {
+      *too_large = true;
+    }
+    return std::string();
+  }
+  return data;
+}
+
+static bool UnpackerAtomicWrite(const std::string& path, const std::string& data) {
+  std::string temporary = path + ".tmp";
+  int fd = TEMP_FAILURE_RETRY(open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600));
+  if (fd == -1) {
+    return false;
+  }
+  bool success = UnpackerWriteAll(fd, data.data(), data.size()) && fsync(fd) == 0;
+  if (close(fd) != 0) {
+    success = false;
+  }
+  if (!success || rename(temporary.c_str(), path.c_str()) != 0) {
+    unlink(temporary.c_str());
+    return false;
+  }
+  return true;
+}
+
+static bool UnpackerValidRunId(const std::string& value) {
+  if (value.empty() || value.size() > 64) {
+    return false;
+  }
+  char first = value.front();
+  if (!((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') ||
+        (first >= '0' && first <= '9'))) {
+    return false;
+  }
+  for (char ch : value) {
+    if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+          (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-')) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool UnpackerValidSha256(const std::string& value) {
+  if (value.size() != 64) {
+    return false;
+  }
+  for (char ch : value) {
+    if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool UnpackerJsonString(cJSON* object, const char* name, std::string* output) {
+  cJSON* item = cJSON_GetObjectItemCaseSensitive(object, name);
+  if (!cJSON_IsString(item)) {
+    return false;
+  }
+  char* value = cJSON_GetStringValue(item);
+  if (value == nullptr) {
+    return false;
+  }
+  *output = value;
+  return true;
+}
+
+static bool UnpackerJsonUint32(cJSON* object, const char* name, uint32_t* output) {
+  cJSON* item = cJSON_GetObjectItemCaseSensitive(object, name);
+  if (!cJSON_IsNumber(item)) {
+    return false;
+  }
+  double value = cJSON_GetNumberValue(item);
+  if (value < 0 || value > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+  uint32_t converted = static_cast<uint32_t>(value);
+  if (static_cast<double>(converted) != value) {
+    return false;
+  }
+  *output = converted;
+  return true;
+}
+
+static bool UnpackerLoadV1Config(UnpackerV1Config* config, std::string* reason) {
+  bool too_large = false;
+  std::string data = UnpackerReadFile(
+      UNPACKER_V1_CONFIG, UNPACKER_V1_MAX_CONFIG_SIZE, &too_large);
+  if (too_large) {
+    *reason = "task_config_too_large";
+    return false;
+  }
+  if (data.empty()) {
+    *reason = "task_config_missing_or_empty";
+    return false;
+  }
+  cJSON* root = cJSON_ParseWithOpts(data.c_str(), nullptr, true);
+  if (root == nullptr) {
+    *reason = "task_config_invalid_json";
+    return false;
+  }
+  uint32_t version = 0;
+  cJSON* tasks = cJSON_GetObjectItemCaseSensitive(root, "tasks");
+  bool valid = UnpackerJsonUint32(root, "version", &version) && version == 1 &&
+               UnpackerJsonString(root, "run_id", &config->run_id) &&
+               UnpackerJsonString(root, "package", &config->package_name) &&
+               UnpackerValidRunId(config->run_id) && cJSON_IsArray(tasks);
+  if (!valid) {
+    cJSON_Delete(root);
+    *reason = "task_config_invalid_header";
+    return false;
+  }
+  int task_count = cJSON_GetArraySize(tasks);
+  if (task_count <= 0 || task_count > UNPACKER_V1_MAX_TASKS) {
+    cJSON_Delete(root);
+    *reason = "task_config_invalid_task_count";
+    return false;
+  }
+  config->tasks.clear();
+  for (int index = 0; index < task_count; ++index) {
+    cJSON* item = cJSON_GetArrayItem(tasks, index);
+    UnpackerV1Task task;
+    valid = item != nullptr &&
+            UnpackerJsonString(item, "dex_sha256", &task.dex_sha256) &&
+            UnpackerJsonUint32(item, "method_idx", &task.method_idx) &&
+            UnpackerJsonString(item, "class_descriptor", &task.class_descriptor) &&
+            UnpackerJsonString(item, "name", &task.name) &&
+            UnpackerJsonString(item, "signature", &task.signature) &&
+            UnpackerJsonUint32(item, "access_flags", &task.access_flags) &&
+            UnpackerJsonString(item, "invoke_policy", &task.invoke_policy) &&
+            UnpackerValidSha256(task.dex_sha256) &&
+            task.class_descriptor.size() >= 3 && task.class_descriptor.front() == 'L' &&
+            task.class_descriptor.back() == ';' &&
+            task.name != "<init>" && task.name != "<clinit>" &&
+            task.signature.compare(0, 2, "()") == 0 &&
+            (task.access_flags & (kAccNative | kAccAbstract)) == 0 &&
+            (task.invoke_policy == "static_no_args" ||
+             task.invoke_policy == "instance_zero_no_args");
+    bool task_static = (task.access_flags & kAccStatic) != 0;
+    valid = valid && ((task.invoke_policy == "static_no_args" && task_static) ||
+                      (task.invoke_policy == "instance_zero_no_args" && !task_static));
+    for (const UnpackerV1Task& existing : config->tasks) {
+      if (existing.dex_sha256 == task.dex_sha256 && existing.method_idx == task.method_idx) {
+        valid = false;
+        break;
+      }
+    }
+    if (!valid) {
+      cJSON_Delete(root);
+      config->tasks.clear();
+      *reason = StringPrintf("task_config_invalid_task_%d", index);
+      return false;
+    }
+    config->tasks.push_back(task);
+  }
+  cJSON_Delete(root);
+  return true;
+}
+
+static bool UnpackerClearJniException(JNIEnv* env) {
+  if (!env->ExceptionCheck()) {
+    return false;
+  }
+  env->ExceptionClear();
+  return true;
+}
+
+static std::string UnpackerCurrentProcessName(JNIEnv* env) {
+  jclass activity_thread = env->FindClass("android/app/ActivityThread");
+  if (activity_thread == nullptr || UnpackerClearJniException(env)) {
+    return std::string();
+  }
+  jmethodID current_process_name = env->GetStaticMethodID(
+      activity_thread, "currentProcessName", "()Ljava/lang/String;");
+  if (current_process_name == nullptr || UnpackerClearJniException(env)) {
+    env->DeleteLocalRef(activity_thread);
+    return std::string();
+  }
+  jstring value = reinterpret_cast<jstring>(
+      env->CallStaticObjectMethod(activity_thread, current_process_name));
+  if (value == nullptr || UnpackerClearJniException(env)) {
+    env->DeleteLocalRef(activity_thread);
+    return std::string();
+  }
+  const char* chars = env->GetStringUTFChars(value, nullptr);
+  std::string result = chars == nullptr ? std::string() : std::string(chars);
+  if (chars != nullptr) {
+    env->ReleaseStringUTFChars(value, chars);
+  }
+  env->DeleteLocalRef(value);
+  env->DeleteLocalRef(activity_thread);
+  return result;
+}
+
+static std::string UnpackerDexSha256(JNIEnv* env, const DexFile* dex_file) {
+  auto cached = Unpacker_dex_sha256_.find(dex_file);
+  if (cached != Unpacker_dex_sha256_.end()) {
+    return cached->second;
+  }
+  jclass digest_class = env->FindClass("java/security/MessageDigest");
+  if (digest_class == nullptr || UnpackerClearJniException(env)) {
+    return std::string();
+  }
+  jmethodID get_instance = env->GetStaticMethodID(
+      digest_class, "getInstance", "(Ljava/lang/String;)Ljava/security/MessageDigest;");
+  jmethodID update = env->GetMethodID(digest_class, "update", "([BII)V");
+  jmethodID digest_method = env->GetMethodID(digest_class, "digest", "()[B");
+  if (get_instance == nullptr || update == nullptr || digest_method == nullptr ||
+      UnpackerClearJniException(env)) {
+    env->DeleteLocalRef(digest_class);
+    return std::string();
+  }
+  jstring algorithm = env->NewStringUTF("SHA-256");
+  jobject digest = env->CallStaticObjectMethod(digest_class, get_instance, algorithm);
+  if (digest == nullptr || UnpackerClearJniException(env)) {
+    env->DeleteLocalRef(algorithm);
+    env->DeleteLocalRef(digest_class);
+    return std::string();
+  }
+  const size_t chunk_size = 64 * 1024;
+  jbyteArray chunk = env->NewByteArray(chunk_size);
+  if (chunk == nullptr || UnpackerClearJniException(env)) {
+    env->DeleteLocalRef(digest);
+    env->DeleteLocalRef(algorithm);
+    env->DeleteLocalRef(digest_class);
+    return std::string();
+  }
+  const uint8_t* begin = dex_file->Begin();
+  size_t size = dex_file->Size();
+  for (size_t offset = 0; offset < size; offset += chunk_size) {
+    size_t count = std::min(chunk_size, size - offset);
+    env->SetByteArrayRegion(chunk, 0, count, reinterpret_cast<const jbyte*>(begin + offset));
+    env->CallVoidMethod(digest, update, chunk, 0, static_cast<jint>(count));
+    if (UnpackerClearJniException(env)) {
+      env->DeleteLocalRef(chunk);
+      env->DeleteLocalRef(digest);
+      env->DeleteLocalRef(algorithm);
+      env->DeleteLocalRef(digest_class);
+      return std::string();
+    }
+  }
+  jbyteArray result = reinterpret_cast<jbyteArray>(env->CallObjectMethod(digest, digest_method));
+  std::string hex;
+  if (result != nullptr && !UnpackerClearJniException(env) && env->GetArrayLength(result) == 32) {
+    std::array<jbyte, 32> bytes;
+    env->GetByteArrayRegion(result, 0, bytes.size(), bytes.data());
+    static const char digits[] = "0123456789abcdef";
+    hex.resize(64);
+    for (size_t index = 0; index < bytes.size(); ++index) {
+      uint8_t value = static_cast<uint8_t>(bytes[index]);
+      hex[index * 2] = digits[value >> 4];
+      hex[index * 2 + 1] = digits[value & 0x0f];
+    }
+  }
+  if (result != nullptr) {
+    env->DeleteLocalRef(result);
+  }
+  env->DeleteLocalRef(chunk);
+  env->DeleteLocalRef(digest);
+  env->DeleteLocalRef(algorithm);
+  env->DeleteLocalRef(digest_class);
+  if (!hex.empty()) {
+    Unpacker_dex_sha256_[dex_file] = hex;
+  }
+  return hex;
+}
+
+static std::string UnpackerTaskStatePath(const UnpackerV1Config& config, size_t task_index) {
+  return StringPrintf("%s/v1/%s/state/%06zu.json", Unpacker_dump_dir_.c_str(),
+                      config.run_id.c_str(), task_index);
+}
+
+static bool UnpackerEnsureTaskStateDir(const UnpackerV1Config& config) {
+  std::string v1_dir = Unpacker_dump_dir_ + "/v1";
+  std::string run_dir = v1_dir + "/" + config.run_id;
+  std::string state_dir = run_dir + "/state";
+  return (mkdir(v1_dir.c_str(), 0700) == 0 || errno == EEXIST) &&
+         (mkdir(run_dir.c_str(), 0700) == 0 || errno == EEXIST) &&
+         (mkdir(state_dir.c_str(), 0700) == 0 || errno == EEXIST);
+}
+
+static std::string UnpackerReadTaskStatus(const std::string& path) {
+  bool too_large = false;
+  std::string data = UnpackerReadFile(path, 64 * 1024, &too_large);
+  if (too_large) {
+    return "invalid";
+  }
+  if (data.empty()) {
+    return "pending";
+  }
+  cJSON* root = cJSON_ParseWithOpts(data.c_str(), nullptr, true);
+  if (root == nullptr) {
+    return "invalid";
+  }
+  std::string status;
+  bool valid = UnpackerJsonString(root, "status", &status);
+  cJSON_Delete(root);
+  return valid ? status : "invalid";
+}
+
+static bool UnpackerWriteTaskState(const UnpackerV1Config& config, size_t task_index,
+                                   const UnpackerV1Task& task, const char* status,
+                                   const std::string& reason) {
+  cJSON* root = cJSON_CreateObject();
+  cJSON_AddNumberToObject(root, "version", 1);
+  cJSON_AddStringToObject(root, "run_id", config.run_id.c_str());
+  cJSON_AddNumberToObject(root, "task_index", task_index);
+  cJSON_AddStringToObject(root, "dex_sha256", task.dex_sha256.c_str());
+  cJSON_AddNumberToObject(root, "method_idx", task.method_idx);
+  cJSON_AddStringToObject(root, "class_descriptor", task.class_descriptor.c_str());
+  cJSON_AddStringToObject(root, "name", task.name.c_str());
+  cJSON_AddStringToObject(root, "signature", task.signature.c_str());
+  cJSON_AddStringToObject(root, "status", status);
+  cJSON_AddStringToObject(root, "reason", reason.c_str());
+  char* json = cJSON_PrintUnformatted(root);
+  bool success = json != nullptr &&
+      UnpackerAtomicWrite(UnpackerTaskStatePath(config, task_index),
+                          std::string(json) + "\n");
+  if (json != nullptr) {
+    free(json);
+  }
+  cJSON_Delete(root);
+  return success;
+}
 
 std::string Unpacker::getDumpDir() {
   Thread* const self = Thread::Current();
@@ -194,153 +594,206 @@ mirror::ClassLoader* Unpacker::getAppClassLoader() {
 }
 
 void Unpacker::invokeAllMethods() {
-  //dump类的六种status: 
-  //Ready: 该类准备dump
-  //Resolved: ResolveClass成功
-  //ResolveClassFailed: ResolveClass失败
-  //Inited: EnsureInitialized成功
-  //EnsureInitializedFailed: EnsureInitialized失败
-  //Dumped: dump所有method成功
-
   Thread* const self = Thread::Current();
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
+  JNIEnv* env = self->GetJniEnv();
+  UnpackerV1Config config;
+  std::string config_reason;
+  if (!UnpackerLoadV1Config(&config, &config_reason)) {
+    ULOGW("V1 task config unavailable: %s", config_reason.c_str());
+    return;
+  }
+  std::string process_name = UnpackerCurrentProcessName(env);
+  if (process_name != config.package_name) {
+    ULOGE("V1 package mismatch: expected %s, actual %s", config.package_name.c_str(),
+          process_name.c_str());
+    return;
+  }
+  if (!UnpackerEnsureTaskStateDir(config)) {
+    ULOGE("V1 cannot create state directory: %s", strerror(errno));
+    return;
+  }
 
-  for (const DexFile* dex_file : Unpacker_dex_files_) {
-    uint32_t class_idx = 0;
-    bool skip_clinit = false;
-    cJSON* dex = nullptr;
-    cJSON* current = nullptr;
-    cJSON* failures = nullptr;
-    cJSON* dexes = cJSON_GetObjectItemCaseSensitive(Unpacker_json_, "dexes");
-    CHECK(dexes != nullptr);
-    cJSON_ArrayForEach(dex, dexes) {
-      cJSON *location = cJSON_GetObjectItemCaseSensitive(dex, "location");
-      cJSON *dump_path = cJSON_GetObjectItemCaseSensitive(dex, "dump_path");
-      cJSON *class_size = cJSON_GetObjectItemCaseSensitive(dex, "class_size");
-      char* location_str = cJSON_GetStringValue(location);
-      char* dump_path_str = cJSON_GetStringValue(dump_path);
-      uint32_t class_size_num = cJSON_GetNumberValue(class_size);
-      if (strcmp(location_str, dex_file->GetLocation().c_str()) == 0
-        && strcmp(dump_path_str, getDexDumpPath(dex_file).c_str()) == 0
-        && class_size_num == dex_file->NumClassDefs()) {
-        // 已经处理过的dex
-        current = cJSON_GetObjectItemCaseSensitive(dex, "current");
-        failures = cJSON_GetObjectItemCaseSensitive(dex, "failures");
-        cJSON *index = cJSON_GetObjectItemCaseSensitive(current, "index");
-        cJSON *descriptor = cJSON_GetObjectItemCaseSensitive(current, "descriptor");
-        cJSON *status = cJSON_GetObjectItemCaseSensitive(current, "status");
-        uint32_t index_num = cJSON_GetNumberValue(index);
-        char* descriptor_str = cJSON_GetStringValue(descriptor);
-        char* status_str = cJSON_GetStringValue(status);
-        CHECK(strcmp(descriptor_str, dex_file->GetClassDescriptor(dex_file->GetClassDef(index_num))) == 0);
-        
-        if (strcmp(status_str, "Resolved") == 0) {
-          //如果status为Resolved, 说明进程在EnsureInitialized时结束了, 很大可能是<clinit>调用时进程崩溃/退出, 则不调用<clinit>而直接dump method
-          skip_clinit = true;
-          class_idx = index_num;
-        } else if (strcmp(status_str, "Ready") == 0) {
-          class_idx = index_num;
-        } else {
-          class_idx = index_num + 1;
-        }
+  StackHandleScope<1> loader_scope(self);
+  Handle<mirror::ClassLoader> h_class_loader(
+      loader_scope.NewHandle(Unpacker_class_loader_));
+  if (h_class_loader.Get() == nullptr) {
+    ULOGE("V1 app class loader is unavailable");
+    return;
+  }
+  for (size_t task_index = 0; task_index < config.tasks.size(); ++task_index) {
+    const UnpackerV1Task& task = config.tasks[task_index];
+    std::string state_path = UnpackerTaskStatePath(config, task_index);
+    std::string state = UnpackerReadTaskStatus(state_path);
+    if (state == "running") {
+      UnpackerWriteTaskState(config, task_index, task, "crashed",
+                             "process_terminated_while_running");
+      continue;
+    }
+    if (state == "recovered" || state == "no_change" || state == "crashed" ||
+        state == "skipped") {
+      continue;
+    }
+    if (state != "pending") {
+      UnpackerWriteTaskState(config, task_index, task, "skipped", "invalid_state_file");
+      continue;
+    }
+
+    auto finish = [&](const char* status, const std::string& reason) {
+      if (!UnpackerWriteTaskState(config, task_index, task, status, reason)) {
+        ULOGE("V1 cannot write %s for task %zu: %s", status, task_index, strerror(errno));
+      }
+      ULOGI("V1 task %zu %s:%u %s: %s", task_index, task.dex_sha256.c_str(),
+            task.method_idx, status, reason.c_str());
+    };
+
+    const DexFile* target_dex = nullptr;
+    for (const DexFile* dex_file : Unpacker_dex_files_) {
+      std::string digest = UnpackerDexSha256(env, dex_file);
+      if (digest == task.dex_sha256) {
+        target_dex = dex_file;
         break;
       }
     }
-
-    if (dex == nullptr) {
-      dex = cJSON_CreateObject();
-      cJSON_AddStringToObject(dex, "location", dex_file->GetLocation().c_str());
-      cJSON_AddStringToObject(dex, "dump_path", getDexDumpPath(dex_file).c_str());
-      cJSON_AddNumberToObject(dex, "class_size", dex_file->NumClassDefs());
-      current = cJSON_AddObjectToObject(dex, "current");
-      cJSON_AddNumberToObject(current, "index", class_idx);
-      cJSON_AddStringToObject(current, "descriptor", dex_file->GetClassDescriptor(dex_file->GetClassDef(class_idx)));
-      cJSON_AddStringToObject(current, "status", "Ready");
-      failures = cJSON_AddArrayToObject(dex, "failures");
-      cJSON_AddItemToArray(dexes, dex);
+    if (target_dex == nullptr) {
+      finish("skipped", "dex_sha256_not_loaded");
+      return;
     }
-    CHECK(current != nullptr);
+    if (task.method_idx >= target_dex->NumMethodIds()) {
+      finish("skipped", "method_idx_out_of_range");
+      return;
+    }
+    const DexFile::MethodId& method_id = target_dex->GetMethodId(task.method_idx);
+    std::string actual_class = target_dex->GetMethodDeclaringClassDescriptor(method_id);
+    std::string actual_name = target_dex->GetMethodName(method_id);
+    std::string actual_signature = target_dex->GetMethodSignature(method_id).ToString();
+    if (actual_class != task.class_descriptor || actual_name != task.name ||
+        actual_signature != task.signature) {
+      finish("skipped", "dex_method_metadata_mismatch");
+      return;
+    }
 
-    mirror::DexCache* dex_cache = class_linker->FindDexCache(self, *dex_file, false);
-    StackHandleScope<2> hs(self);
-    Handle<mirror::ClassLoader> h_class_loader(hs.NewHandle(Unpacker_class_loader_));
-    Handle<mirror::DexCache> h_dex_cache(hs.NewHandle(dex_cache));
-    
-    for (; class_idx < dex_file->NumClassDefs(); class_idx++) {
-      const char* class_descriptor = dex_file->GetClassDescriptor(dex_file->GetClassDef(class_idx));
-      ULOGI("dumping class %s %u/%u in %s", class_descriptor, 
-            class_idx, dex_file->NumClassDefs(), dex_file->GetLocation().c_str());
+    uint32_t class_index = 0;
+    bool class_found = false;
+    for (; class_index < target_dex->NumClassDefs(); ++class_index) {
+      const DexFile::ClassDef& class_def = target_dex->GetClassDef(class_index);
+      if (task.class_descriptor == target_dex->GetClassDescriptor(class_def)) {
+        class_found = true;
+        break;
+      }
+    }
+    if (!class_found) {
+      finish("skipped", "declaring_class_not_defined_in_dex");
+      return;
+    }
 
-      //Ready
-      cJSON_ReplaceItemInObject(current, "index", cJSON_CreateNumber(class_idx));
-      cJSON_ReplaceItemInObject(current, "descriptor", cJSON_CreateString(class_descriptor));
-      cJSON_ReplaceItemInObject(current, "status", cJSON_CreateString("Ready"));
-      writeJson();
-
-      mirror::Class* klass = class_linker->ResolveType(*dex_file, dex_file->GetClassDef(class_idx).class_idx_, h_dex_cache, h_class_loader);
-      if (klass == nullptr) {
-        cJSON_ReplaceItemInObject(current, "status", cJSON_CreateString("ResolveClassFailed"));
-        std::string reason = StringPrintf("ResolveClass error: %s", self->GetException()->Dump().c_str());
-        cJSON *failure = cJSON_CreateObject();
-        cJSON_AddNumberToObject(failure, "index", class_idx);
-        cJSON_AddStringToObject(failure, "descriptor", dex_file->GetClassDescriptor(dex_file->GetClassDef(class_idx)));
-        cJSON_AddStringToObject(failure, "reason", reason.c_str());
-        cJSON_AddItemToArray(failures, failure);
-        writeJson();
+    mirror::DexCache* dex_cache = class_linker->FindDexCache(self, *target_dex, false);
+    if (dex_cache == nullptr) {
+      finish("skipped", "dex_cache_not_found");
+      return;
+    }
+    StackHandleScope<1> dex_cache_scope(self);
+    Handle<mirror::DexCache> h_dex_cache(dex_cache_scope.NewHandle(dex_cache));
+    const DexFile::ClassDef& class_def = target_dex->GetClassDef(class_index);
+    mirror::Class* klass = class_linker->ResolveType(
+        *target_dex, class_def.class_idx_, h_dex_cache, h_class_loader);
+    if (klass == nullptr) {
+      if (self->IsExceptionPending()) {
         self->ClearException();
-        skip_clinit = false;
-        continue;
       }
-      cJSON_ReplaceItemInObject(current, "status", cJSON_CreateString("Resolved"));
-      writeJson();
-      StackHandleScope<1> hs2(self);
-      Handle<mirror::Class> h_class(hs2.NewHandle(klass));
-      if (!skip_clinit) {
-        bool suc = class_linker->EnsureInitialized(self, h_class, true, true);
-        if (!suc) {
-          cJSON_ReplaceItemInObject(current, "status", cJSON_CreateString("EnsureInitializedFailed"));
-          writeJson();
-          self->ClearException();
-          ObjectLock<mirror::Class> lock(self, h_class);
-          mirror::Class::SetStatus(h_class, mirror::Class::kStatusInitialized, self);
-        } else {
-          cJSON_ReplaceItemInObject(current, "status", cJSON_CreateString("Inited"));
-          writeJson();
-        }
-      } else {
-        ObjectLock<mirror::Class> lock(self, h_class);
-        mirror::Class::SetStatus(h_class, mirror::Class::kStatusInitialized, self);
-        skip_clinit = false;
-        cJSON_ReplaceItemInObject(current, "status", cJSON_CreateString("Inited"));
-        writeJson();
-      }
-      
-      size_t pointer_size = class_linker->GetImagePointerSize();
-      auto methods = klass->GetDeclaredMethods(pointer_size);
-
-      Unpacker::enableFakeInvoke();
-      for (auto& m : methods) {
-        ArtMethod* method = &m;
-        if (!method->IsProxyMethod() && method->IsInvokable()) {
-          uint32_t args_size = (uint32_t)ArtMethod::NumArgRegisters(method->GetShorty());
-          if (!method->IsStatic()) {
-            args_size += 1;
-          }
-          
-          JValue result;
-          std::vector<uint32_t> args(args_size, 0);
-          if (!method->IsStatic()) {
-            mirror::Object* thiz = klass->AllocObject(self);
-            args[0] = StackReference<mirror::Object>::FromMirrorPtr(thiz).AsVRegValue();  
-          }
-          method->Invoke(self, args.data(), args_size, &result, method->GetShorty());
-        }
-      }
-      Unpacker::disableFakeInvoke();
-
-      cJSON_ReplaceItemInObject(current, "status", cJSON_CreateString("Dumped"));
-      writeJson();
+      finish("skipped", "resolve_class_failed");
+      return;
     }
+    StackHandleScope<1> class_scope(self);
+    Handle<mirror::Class> h_class(class_scope.NewHandle(klass));
+    if (!h_class->IsInitialized()) {
+      finish("skipped", "class_not_already_initialized");
+      return;
+    }
+
+    ArtMethod* target_method = nullptr;
+    size_t pointer_size = class_linker->GetImagePointerSize();
+    for (ArtMethod& method : h_class->GetDeclaredMethods(pointer_size)) {
+      if (method.GetDexMethodIndex() == task.method_idx) {
+        target_method = &method;
+        break;
+      }
+    }
+    if (target_method == nullptr) {
+      finish("skipped", "declared_method_not_found");
+      return;
+    }
+    if (target_method->IsProxyMethod() || !target_method->IsInvokable() ||
+        target_method->IsNative() || target_method->IsAbstract() ||
+        target_method->IsConstructor()) {
+      finish("skipped", "runtime_method_policy_rejected");
+      return;
+    }
+    bool runtime_static = target_method->IsStatic();
+    bool policy_static = task.invoke_policy == "static_no_args";
+    if (runtime_static != policy_static ||
+        (target_method->GetAccessFlags() & (kAccStatic | kAccNative | kAccAbstract)) !=
+        (task.access_flags & (kAccStatic | kAccNative | kAccAbstract))) {
+      finish("skipped", "runtime_access_flags_mismatch");
+      return;
+    }
+    if (ArtMethod::NumArgRegisters(target_method->GetShorty()) != 0) {
+      finish("skipped", "runtime_method_has_arguments");
+      return;
+    }
+
+    if (!UnpackerWriteTaskState(config, task_index, task, "running", "invoke_started")) {
+      ULOGE("V1 cannot persist running state for task %zu", task_index);
+      return;
+    }
+    Unpacker_before_code_item_.clear();
+    const DexFile::CodeItem* before = target_method->GetCodeItem();
+    if (before != nullptr) {
+      size_t before_size = Unpacker::getCodeItemSize(target_method);
+      if (before_size > 0 && before_size <= UNPACKER_V1_MAX_CODE_ITEM_SIZE) {
+        const uint8_t* begin = reinterpret_cast<const uint8_t*>(before);
+        Unpacker_before_code_item_.assign(begin, begin + before_size);
+      }
+    }
+    Unpacker_target_method_ = target_method;
+    Unpacker_dumped_code_item_.clear();
+    Unpacker_dump_succeeded_ = false;
+    Unpacker::enableFakeInvoke();
+
+    uint32_t args_size = runtime_static ? 0 : 1;
+    std::vector<uint32_t> args(args_size, 0);
+    if (!runtime_static) {
+      mirror::Object* receiver = h_class->AllocObject(self);
+      if (receiver == nullptr) {
+        Unpacker::disableFakeInvoke();
+        Unpacker_target_method_ = nullptr;
+        if (self->IsExceptionPending()) {
+          self->ClearException();
+        }
+        finish("skipped", "receiver_allocation_failed");
+        return;
+      }
+      args[0] = StackReference<mirror::Object>::FromMirrorPtr(receiver).AsVRegValue();
+    }
+    JValue result;
+    target_method->Invoke(self, args.data(), args_size, &result, target_method->GetShorty());
+    bool invoke_exception = self->IsExceptionPending();
+    if (invoke_exception) {
+      self->ClearException();
+    }
+    Unpacker::disableFakeInvoke();
+    Unpacker::disableRealInvoke();
+    Unpacker_target_method_ = nullptr;
+
+    if (!Unpacker_dump_succeeded_) {
+      finish("no_change", invoke_exception ? "invoke_exception_without_dump" :
+                                             "target_method_not_dumped");
+    } else if (Unpacker_before_code_item_ == Unpacker_dumped_code_item_) {
+      finish("no_change", "code_item_identical");
+    } else {
+      finish("recovered", "code_item_changed_and_dumped");
+    }
+    return;
   }
 }
 
@@ -401,25 +854,31 @@ void Unpacker::fini() {
   Unpacker_fake_invoke_ = false;
   Unpacker_real_invoke_ = false;
   Unpacker_self_ = nullptr;
+  Unpacker_target_method_ = nullptr;
+  Unpacker_before_code_item_.clear();
+  Unpacker_dumped_code_item_.clear();
+  Unpacker_dump_succeeded_ = false;
   if (Unpacker_json_fd_ != -1) {
     close(Unpacker_json_fd_);
+    Unpacker_json_fd_ = -1;
   }
   for(auto iter = Unpacker_method_fds_.begin(); iter != Unpacker_method_fds_.end(); iter++) {
     close(iter->second);
   }
-  cJSON_Delete(Unpacker_json_);
+  Unpacker_method_fds_.clear();
+  Unpacker_dex_files_.clear();
+  Unpacker_class_loader_ = nullptr;
+  if (Unpacker_json_ != nullptr) {
+    cJSON_Delete(Unpacker_json_);
+    Unpacker_json_ = nullptr;
+  }
 }
 
 void Unpacker::unpack() {
   ScopedObjectAccess soa(Thread::Current());
   ULOGI("%s", "unpack begin!");
-  //1. 初始化
   init();
-  //2. dump所有dex
-  dumpAllDexes();
-  //3. 主动调用所有方法
   invokeAllMethods();
-  //4. 还原
   fini();
   ULOGI("%s", "unpack end!");
 }
@@ -432,8 +891,8 @@ void Unpacker::disableFakeInvoke() {
   Unpacker_fake_invoke_ = false;
 }
 
-bool Unpacker::isFakeInvoke(Thread *self, ArtMethod */*method*/) {
-  if (Unpacker_fake_invoke_ && self == Unpacker_self_) {
+bool Unpacker::isFakeInvoke(Thread *self, ArtMethod *method) {
+  if (Unpacker_fake_invoke_ && self == Unpacker_self_ && method == Unpacker_target_method_) {
       return true;
   }
   return false;
@@ -447,50 +906,44 @@ void Unpacker::disableRealInvoke() {
   Unpacker_real_invoke_ = false;
 }
 
-bool Unpacker::isRealInvoke(Thread *self, ArtMethod */*method*/) {
-  if (Unpacker_real_invoke_ && self == Unpacker_self_) {
+bool Unpacker::isRealInvoke(Thread *self, ArtMethod *method) {
+  if (Unpacker_real_invoke_ && self == Unpacker_self_ && method == Unpacker_target_method_) {
       return true;
   }
   return false;
 }
 
 size_t Unpacker::getCodeItemSize(ArtMethod* method) {
-  const DexFile::CodeItem* code_item = method->GetCodeItem();
-  size_t size = offsetof(DexFile::CodeItem, insns_);
-  size += code_item->insns_size_in_code_units_ * sizeof(uint16_t);
-
-  if (code_item->tries_size_ != 0) {
-    if (code_item->insns_size_in_code_units_ % 2 != 0) {
-      //使 tries 实现四字节对齐的两字节填充. 仅当 tries_size 为非零值且 insns_size 为奇数时, 此元素才会存在
-      uint16_t padding = 2;
-      size += padding;
-    }
-    size += sizeof(DexFile::TryItem) * code_item->tries_size_;
-    const uint8_t* data = (uint8_t *)code_item + size;
-  
-    uint32_t handlers_size = DecodeUnsignedLeb128(&data);
-    size += UnsignedLeb128Size(handlers_size);
-    for (uint32_t handler_index = 0; handler_index < handlers_size; handler_index++) {
-      data = (uint8_t *)code_item + size;
-      int32_t handler_data_size = DecodeSignedLeb128(&data);
-      size += SignedLeb128Size(handler_data_size);
-      for (int32_t handler_data_index = 0; handler_data_index < abs(handler_data_size); handler_data_index++) {
-        data = (uint8_t *)code_item + size;
-        size += UnsignedLeb128Size(DecodeUnsignedLeb128(&data));
-        data = (uint8_t *)code_item + size;
-        size += UnsignedLeb128Size(DecodeUnsignedLeb128(&data));
-      }
-      if (handler_data_size <= 0) {
-        data = (uint8_t *)code_item + size;
-        size += UnsignedLeb128Size(DecodeUnsignedLeb128(&data));
-      }
-    }
+  if (method == nullptr) {
+    return 0;
   }
-
+  const DexFile* dex_file = method->GetDexFile();
+  const DexFile::CodeItem* code_item = method->GetCodeItem();
+  if (dex_file == nullptr || code_item == nullptr || dex_file->Begin() == nullptr) {
+    return 0;
+  }
+  uintptr_t dex_begin = reinterpret_cast<uintptr_t>(dex_file->Begin());
+  uintptr_t code_begin = reinterpret_cast<uintptr_t>(code_item);
+  if (dex_file->Size() > std::numeric_limits<uintptr_t>::max() - dex_begin) {
+    return 0;
+  }
+  uintptr_t dex_end = dex_begin + dex_file->Size();
+  if (code_begin < dex_begin || code_begin >= dex_end) {
+    return 0;
+  }
+  size_t size = 0;
+  size_t available = static_cast<size_t>(dex_end - code_begin);
+  if (!youpk_v1::MeasureCodeItemSize(reinterpret_cast<const uint8_t*>(code_item), available,
+                                     UNPACKER_V1_MAX_CODE_ITEM_SIZE, &size)) {
+    return 0;
+  }
   return size;
 }
 
 void Unpacker::dumpMethod(ArtMethod *method, int nop_size) {
+  if (method != Unpacker_target_method_) {
+    return;
+  }
   std::string dump_path = Unpacker::getMethodDumpPath(method);
   int fd = -1;
   if (Unpacker_method_fds_.find(dump_path) != Unpacker_method_fds_.end()) {
@@ -510,6 +963,13 @@ void Unpacker::dumpMethod(ArtMethod *method, int nop_size) {
   const char* name = str_name.c_str();
   const DexFile::CodeItem* code_item = method->GetCodeItem();
   uint32_t code_item_size = (uint32_t)Unpacker::getCodeItemSize(method);
+  if (code_item == nullptr || code_item_size == 0 ||
+      code_item_size > UNPACKER_V1_MAX_CODE_ITEM_SIZE ||
+      nop_size < 0 || static_cast<uint32_t>(nop_size) > code_item_size -
+          offsetof(DexFile::CodeItem, insns_)) {
+    ULOGW("invalid CodeItem for %s", PrettyMethod(method).c_str());
+    return;
+  }
 
   size_t total_size = 4 + strlen(name) + 1 + 4 + code_item_size;
   std::vector<uint8_t> data(total_size);
@@ -524,17 +984,25 @@ void Unpacker::dumpMethod(ArtMethod *method, int nop_size) {
   if (nop_size != 0) {
     memset(buf + offsetof(DexFile::CodeItem, insns_), 0, nop_size);
   }
-
-  ssize_t written_size = write(fd, data.data(), total_size);
-  if (written_size > (ssize_t)total_size) {
-    ULOGW("write %s in %s %zd/%zu error: %s", PrettyMethod(method).c_str(), dump_path.c_str(), written_size, total_size, strerror(errno));
+  Unpacker_dumped_code_item_.assign(buf, buf + code_item_size);
+  if (!UnpackerWriteAll(fd, data.data(), total_size) || fsync(fd) != 0) {
+    ULOGW("write %s in %s error: %s", PrettyMethod(method).c_str(), dump_path.c_str(),
+          strerror(errno));
+    Unpacker_dumped_code_item_.clear();
+    return;
   }
+  Unpacker_dump_succeeded_ = true;
 }
 
 //继续解释执行返回false, dump完成返回true
 bool Unpacker::beforeInstructionExecute(Thread *self, ArtMethod *method, uint32_t dex_pc, int inst_count) {
   if (Unpacker::isFakeInvoke(self, method)) {
-    const uint16_t* const insns = method->GetCodeItem()->insns_;
+    const DexFile::CodeItem* code_item = method->GetCodeItem();
+    if (code_item == nullptr || Unpacker::getCodeItemSize(method) == 0 ||
+        dex_pc >= code_item->insns_size_in_code_units_) {
+      return true;
+    }
+    const uint16_t* const insns = code_item->insns_;
     const Instruction* inst = Instruction::At(insns + dex_pc);
     uint16_t inst_data = inst->Fetch16(0);
     Instruction::Code opcode = inst->Opcode(inst_data);
@@ -558,7 +1026,7 @@ bool Unpacker::beforeInstructionExecute(Thread *self, ArtMethod *method, uint32_
       if (opcode >= Instruction::GOTO && opcode <= Instruction::GOTO_32) {
         //写入时将第一条GOTO用nop填充
         const Instruction* inst_first = Instruction::At(insns);
-        Instruction::Code first_opcode = inst_first->Opcode(inst->Fetch16(0));
+        Instruction::Code first_opcode = inst_first->Opcode(inst_first->Fetch16(0));
         CHECK(first_opcode >= Instruction::GOTO && first_opcode <= Instruction::GOTO_32);
         ULOGD("found najia/ijiami %s", PrettyMethod(method).c_str());
         switch (first_opcode)
@@ -587,12 +1055,22 @@ bool Unpacker::beforeInstructionExecute(Thread *self, ArtMethod *method, uint32_
 }
 
 bool Unpacker::afterInstructionExecute(Thread *self, ArtMethod *method, uint32_t dex_pc, int inst_count) {
-  const uint16_t* const insns = method->GetCodeItem()->insns_;
+  if (!Unpacker::isRealInvoke(self, method)) {
+    return false;
+  }
+  const DexFile::CodeItem* code_item = method->GetCodeItem();
+  if (code_item == nullptr || Unpacker::getCodeItemSize(method) == 0 ||
+      dex_pc >= code_item->insns_size_in_code_units_) {
+    Unpacker::enableFakeInvoke();
+    Unpacker::disableRealInvoke();
+    return false;
+  }
+  const uint16_t* const insns = code_item->insns_;
   const Instruction* inst = Instruction::At(insns + dex_pc);
   uint16_t inst_data = inst->Fetch16(0);
   Instruction::Code opcode = inst->Opcode(inst_data);
-  if (inst_count == 2 && (opcode == Instruction::INVOKE_STATIC || opcode == Instruction::INVOKE_STATIC_RANGE) 
-      && Unpacker::isRealInvoke(self, method)) {
+  if (inst_count == 2 &&
+      (opcode == Instruction::INVOKE_STATIC || opcode == Instruction::INVOKE_STATIC_RANGE)) {
     Unpacker::enableFakeInvoke();
     Unpacker::disableRealInvoke();
   }
@@ -614,4 +1092,3 @@ void Unpacker::register_cn_youlor_Unpacker(JNIEnv* env) {
 }
 
 }
-

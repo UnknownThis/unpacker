@@ -41,7 +41,7 @@ private:
 
   //初始化
   static void init() SHARED_REQUIRES(Locks::mutator_lock_);
-  //主动调用所有方法
+  //执行下一个显式白名单方法任务
   static void invokeAllMethods() SHARED_REQUIRES(Locks::mutator_lock_);
   //dump dex
   static void dumpAllDexes();

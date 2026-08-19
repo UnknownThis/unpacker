@@ -7,6 +7,7 @@ import java.io.File;
 
 public class Unpacker {
     public static String UNPACK_CONFIG = "/data/local/tmp/unpacker.config";
+    public static String TASK_CONFIG = "/data/local/tmp/unpacker.tasks.v1.json";
     public static int UNPACK_INTERVAL = 10 * 1000;
     public static Thread unpackerThread = null;
 
@@ -28,7 +29,7 @@ public class Unpacker {
         catch (Exception ignored) {
             
         }
-        return should_unpack;
+        return should_unpack && new File(TASK_CONFIG).isFile();
     }
 
     public static void unpack() {
